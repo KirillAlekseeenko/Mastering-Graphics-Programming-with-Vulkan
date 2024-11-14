@@ -62,6 +62,10 @@ static TextureHandle create_texture_from_file( GpuDevice& gpu, cstring filename,
 
         raptor::TextureHandle new_texture = gpu.create_texture( creation );
 
+        if (gpu.bindless_supported) {
+            gpu.bindless_texture_updates.push(ResourceUpdate{ ResourceDeletionType::Texture, new_texture.index, gpu.current_frame });
+        }
+
         // IMPORTANT:
         // Free memory loaded from file, it should not matter!
         free( image_data );

@@ -61,6 +61,11 @@ struct alignas( 16 ) MaterialData {
     f32   roughness_factor;
     f32   occlusion_factor;
     u32   flags;
+    u32   base_color_texture_index;
+    u32   normal_texture_index;
+    u32   roughness_metalness_texture_index;
+    u32   emissive_texture_index;
+    u32   occlusion_texture_index;
 };
 
 struct MeshDraw {
@@ -214,6 +219,10 @@ int main( int argc, char** argv ) {
     u32 zero_value = 0;
     texture_creation.set_name( "dummy_texture" ).set_size( 1, 1, 1 ).set_format_type( VK_FORMAT_R8G8B8A8_UNORM, TextureType::Texture2D ).set_flags( 1, 0 ).set_data( &zero_value );
     TextureHandle dummy_texture = gpu.create_texture( texture_creation );
+
+    if (gpu.bindless_supported) {
+        gpu.bindless_texture_updates.push(ResourceUpdate{ ResourceDeletionType::Texture, dummy_texture.index, gpu.current_frame });
+    }
 
     SamplerCreation sampler_creation{ };
     sampler_creation.min_filter = VK_FILTER_LINEAR;
@@ -372,6 +381,9 @@ void main() {
 )FOO";
 
         const char* fs_code = R"FOO(#version 450
+
+#extension GL_EXT_nonuniform_qualifier : enable
+
 uint MaterialFeatures_ColorTexture     = 1 << 0;
 uint MaterialFeatures_NormalTexture    = 1 << 1;
 uint MaterialFeatures_RoughnessTexture = 1 << 2;
@@ -398,6 +410,11 @@ layout(std140, binding = 1) uniform MaterialConstant {
     float roughness_factor;
     float occlusion_factor;
     uint  flags;
+    uint  base_color_texture_index;
+    uint  normal_texture_index;
+    uint  roughness_metalness_texture_index;
+    uint  emissive_texture_index;
+    uint  occlusion_texture_index;
 };
 
 layout (binding = 2) uniform sampler2D diffuseTexture;
@@ -405,6 +422,9 @@ layout (binding = 3) uniform sampler2D roughnessMetalnessTexture;
 layout (binding = 4) uniform sampler2D occlusionTexture;
 layout (binding = 5) uniform sampler2D emissiveTexture;
 layout (binding = 6) uniform sampler2D normalTexture;
+
+layout ( set = 1, binding = 10 ) uniform sampler2D global_textures[];     // typical trick of aliasing textures for different usages
+layout ( set = 1, binding = 10 ) uniform sampler3D global_textures_3d[];
 
 layout (location = 0) in vec2 vTexcoord0;
 layout (location = 1) in vec3 vNormal;
@@ -508,7 +528,8 @@ void main() {
     // NOTE(marco): normal textures are encoded to [0, 1] but need to be mapped to [-1, 1] value
     vec3 N = normalize( vNormal );
     if ( ( flags & MaterialFeatures_NormalTexture ) != 0 ) {
-        N = normalize( texture(normalTexture, vTexcoord0).rgb * 2.0 - 1.0 );
+        //N = normalize( texture(normalTexture, vTexcoord0).rgb * 2.0 - 1.0 );
+        N = normalize( texture(global_textures[nonuniformEXT(normal_texture_index)], vTexcoord0).rgb * 2.0 - 1.0 );
         N = normalize( TBN * N );
     }
     vec3 H = normalize( L + V );
@@ -520,7 +541,8 @@ void main() {
         // Red channel for occlusion value
         // Green channel contains roughness values
         // Blue channel contains metalness
-        vec4 rm = texture(roughnessMetalnessTexture, vTexcoord0);
+        //vec4 rm = texture(roughnessMetalnessTexture, vTexcoord0);
+        vec4 rm = texture(global_textures[nonuniformEXT(roughness_metalness_texture_index)], vTexcoord0);
 
         roughness *= rm.g;
         metalness *= rm.b;
@@ -528,21 +550,24 @@ void main() {
 
     float ao = 1.0f;
     if ( ( flags & MaterialFeatures_OcclusionTexture ) != 0 ) {
-        ao = texture(occlusionTexture, vTexcoord0).r;
+        //ao = texture(occlusionTexture, vTexcoord0).r;
+        ao = texture(global_textures[nonuniformEXT(occlusion_texture_index)], vTexcoord0).r;
     }
 
     float alpha = pow(roughness, 2.0);
 
     vec4 base_colour = base_color_factor;
     if ( ( flags & MaterialFeatures_ColorTexture ) != 0 ) {
-        vec4 albedo = texture( diffuseTexture, vTexcoord0 );
+        vec4 albedo = texture(global_textures[nonuniformEXT(base_color_texture_index)], vTexcoord0);  // texture( diffuseTexture, vTexcoord0 );
+        //vec4 albedo = texture( diffuseTexture, vTexcoord0 );
         base_colour.rgb *= decode_srgb( albedo.rgb );
         base_colour.a *= albedo.a;
     }
 
     vec3 emissive = vec3( 0 );
     if ( ( flags & MaterialFeatures_EmissiveTexture ) != 0 ) {
-        vec4 e = texture(emissiveTexture, vTexcoord0);
+        //vec4 e = texture(emissiveTexture, vTexcoord0);
+        vec4 e = texture(global_textures[nonuniformEXT(emissive_texture_index)], vTexcoord0);
 
         emissive += decode_srgb( e.rgb ) * emissive_factor;
     }
@@ -836,8 +861,13 @@ void main() {
                         ds_creation.texture_sampler( diffuse_texture_gpu.handle, sampler_handle, 2 );
 
                         mesh_draw.material_data.flags |= MaterialFeatures_ColorTexture;
+
+                        mesh_draw.material_data.base_color_texture_index = diffuse_texture_gpu.handle.index;
+
+                        gpu.link_texture_sampler(diffuse_texture_gpu.handle, sampler_handle);
                     } else {
                         ds_creation.texture_sampler( dummy_texture, dummy_sampler, 2 );
+                        mesh_draw.material_data.base_color_texture_index = dummy_texture.index;
                     }
 
                     if ( material.pbr_metallic_roughness->metallic_roughness_texture != nullptr ) {
@@ -852,8 +882,13 @@ void main() {
                         ds_creation.texture_sampler( roughness_texture_gpu.handle, sampler_handle, 3 );
 
                         mesh_draw.material_data.flags |= MaterialFeatures_RoughnessTexture;
+
+                        // bindless
+                        mesh_draw.material_data.roughness_metalness_texture_index = roughness_texture_gpu.handle.index;
+                        gpu.link_texture_sampler(roughness_texture_gpu.handle, sampler_handle);
                     } else {
                         ds_creation.texture_sampler( dummy_texture, dummy_sampler, 3 );
+                        mesh_draw.material_data.roughness_metalness_texture_index = dummy_texture.index;
                     }
 
                     if ( material.pbr_metallic_roughness->metallic_factor != glTF::INVALID_FLOAT_VALUE ) {
@@ -885,9 +920,14 @@ void main() {
 
                     mesh_draw.material_data.occlusion_factor = material.occlusion_texture->strength != glTF::INVALID_FLOAT_VALUE ? material.occlusion_texture->strength : 1.0f;
                     mesh_draw.material_data.flags |= MaterialFeatures_OcclusionTexture;
+
+                    // bindless
+                    mesh_draw.material_data.occlusion_texture_index = occlusion_texture_gpu.handle.index;
+                    gpu.link_texture_sampler(occlusion_texture_gpu.handle, sampler_handle);
                 } else {
                     mesh_draw.material_data.occlusion_factor = 1.0f;
                     ds_creation.texture_sampler( dummy_texture, dummy_sampler, 4 );
+                    mesh_draw.material_data.occlusion_texture_index = dummy_texture.index;
                 }
 
                 if ( material.emissive_factor_count != 0 ) {
@@ -913,8 +953,12 @@ void main() {
                     ds_creation.texture_sampler( emissive_texture_gpu.handle, sampler_handle, 5 );
 
                     mesh_draw.material_data.flags |= MaterialFeatures_EmissiveTexture;
+
+                    mesh_draw.material_data.emissive_texture_index = emissive_texture_gpu.handle.index;
+                    gpu.link_texture_sampler(emissive_texture_gpu.handle, sampler_handle);
                 } else {
                     ds_creation.texture_sampler( dummy_texture, dummy_sampler, 5 );
+                    mesh_draw.material_data.emissive_texture_index = dummy_texture.index;
                 }
 
                 if ( material.normal_texture != nullptr ) {
@@ -929,8 +973,13 @@ void main() {
                     ds_creation.texture_sampler( normal_texture_gpu.handle, sampler_handle, 6 );
 
                     mesh_draw.material_data.flags |= MaterialFeatures_NormalTexture;
+
+                    // bindless
+                    mesh_draw.material_data.normal_texture_index = normal_texture_gpu.handle.index;
+                    gpu.link_texture_sampler(normal_texture_gpu.handle, sampler_handle);
                 } else {
                     ds_creation.texture_sampler( dummy_texture, dummy_sampler, 6 );
+                    mesh_draw.material_data.normal_texture_index = dummy_texture.index;
                 }
 
                 mesh_draw.descriptor_set = gpu.create_descriptor_set( ds_creation );

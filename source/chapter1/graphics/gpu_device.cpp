@@ -421,9 +421,18 @@ void GpuDevice::init( const DeviceCreation& creation ) {
     queue_info[ 0 ].queueCount = 1;
     queue_info[ 0 ].pQueuePriorities = queue_priority;
 
+    // checking bindless support
+    VkPhysicalDeviceDescriptorIndexingFeatures indexing_features{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_INDEXING_FEATURES, nullptr };
+
     // Enable all features: just pass the physical features 2 struct.
-    VkPhysicalDeviceFeatures2 physical_features2 = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2 };
+    VkPhysicalDeviceFeatures2 physical_features2 = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &indexing_features };
     vkGetPhysicalDeviceFeatures2( vulkan_physical_device, &physical_features2 );
+
+    bindless_supported = indexing_features.descriptorBindingPartiallyBound && indexing_features.runtimeDescriptorArray;
+
+    if (bindless_supported == false) {
+        physical_features2.pNext = nullptr;
+    }
 
     VkDeviceCreateInfo device_create_info = {};
     device_create_info.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
@@ -527,6 +536,76 @@ void GpuDevice::init( const DeviceCreation& creation ) {
     result = vkCreateDescriptorPool( vulkan_device, &pool_info, vulkan_allocation_callbacks, &vulkan_descriptor_pool );
     check( result );
 
+    // create bindless descriptor pool
+    static const u32 k_max_bindless_resources = 512;
+    VkDescriptorPoolSize bindless_pool_sizes[] =
+    {
+        { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, k_max_bindless_resources },
+        { VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, k_max_bindless_resources },
+    };
+
+    VkDescriptorPoolCreateInfo bindless_pool_info = {};
+    bindless_pool_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
+    bindless_pool_info.flags = VK_DESCRIPTOR_POOL_CREATE_UPDATE_AFTER_BIND_BIT_EXT; // special for bindless
+    bindless_pool_info.maxSets = ArraySize(bindless_pool_sizes) * k_max_bindless_resources;
+    bindless_pool_info.poolSizeCount = (u32)ArraySize(bindless_pool_sizes);
+    bindless_pool_info.pPoolSizes = bindless_pool_sizes;
+
+    result = vkCreateDescriptorPool(vulkan_device, &bindless_pool_info, vulkan_allocation_callbacks, &vulkan_bindless_descriptor_pool);
+    check(result);
+
+    // Create bindless layout descriptor
+
+    const uint32_t bindlessBindingCount = 4; // WHY 4??? For the future I guess...
+
+    VkDescriptorSetLayoutBinding bindless_bindings[bindlessBindingCount];
+
+    {
+        VkDescriptorSetLayoutBinding& combinedImageSamplerBinding = bindless_bindings[0];
+        combinedImageSamplerBinding.stageFlags = VK_SHADER_STAGE_ALL;
+        combinedImageSamplerBinding.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        combinedImageSamplerBinding.descriptorCount = k_max_bindless_resources;                 // probably array of descriptors?
+        combinedImageSamplerBinding.binding = k_bindless_texture_binding;
+        combinedImageSamplerBinding.pImmutableSamplers = nullptr;
+    }
+
+    {
+        VkDescriptorSetLayoutBinding& storageImageBinding = bindless_bindings[1];
+        storageImageBinding.stageFlags = VK_SHADER_STAGE_ALL;
+        storageImageBinding.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+        storageImageBinding.descriptorCount = k_max_bindless_resources;
+        storageImageBinding.binding = k_bindless_texture_binding + 1;
+        storageImageBinding.pImmutableSamplers = nullptr;
+    }
+
+    VkDescriptorSetLayoutCreateInfo layout_info = { VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO };
+    layout_info.bindingCount = ArraySize(bindless_pool_sizes);
+    layout_info.pBindings = bindless_bindings;
+    layout_info.flags = VK_DESCRIPTOR_SET_LAYOUT_CREATE_UPDATE_AFTER_BIND_POOL_BIT_EXT;   // Bindless specific, the same as above with descriptor pool
+
+    // setup additional bindless extension flags
+    VkDescriptorBindingFlags bindless_flags = VK_DESCRIPTOR_BINDING_PARTIALLY_BOUND_BIT_EXT | VK_DESCRIPTOR_BINDING_UPDATE_AFTER_BIND_BIT_EXT;
+    VkDescriptorBindingFlags ext_bindless_binding_flags[bindlessBindingCount];
+    ext_bindless_binding_flags[0] = bindless_flags;
+    ext_bindless_binding_flags[1] = bindless_flags;
+
+    VkDescriptorSetLayoutBindingFlagsCreateInfoEXT extended_info{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_BINDING_FLAGS_CREATE_INFO_EXT, nullptr };
+    extended_info.bindingCount = ArraySize(bindless_pool_sizes);
+    extended_info.pBindingFlags = ext_bindless_binding_flags;
+
+    layout_info.pNext = &extended_info;
+
+    check(vkCreateDescriptorSetLayout(vulkan_device, &layout_info, vulkan_allocation_callbacks, &vulkan_bindless_descriptor_set_layout));
+
+    // Creating bindless descriptor set
+
+    VkDescriptorSetAllocateInfo alloc_info{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO };
+    alloc_info.descriptorPool = vulkan_bindless_descriptor_pool;
+    alloc_info.descriptorSetCount = 1;
+    alloc_info.pSetLayouts = &vulkan_bindless_descriptor_set_layout;
+
+    check(vkAllocateDescriptorSets(vulkan_device, &alloc_info, &vulkan_bindless_descriptor_set));
+
     // Create timestamp query pool used for GPU timings.
     VkQueryPoolCreateInfo vqpci{ VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO, nullptr, 0, VK_QUERY_TYPE_TIMESTAMP, creation.gpu_time_queries_per_frame * 2u * k_max_frames, 0 };
     vkCreateQueryPool( vulkan_device, &vqpci, vulkan_allocation_callbacks, &vulkan_timestamp_query_pool );
@@ -576,6 +655,7 @@ void GpuDevice::init( const DeviceCreation& creation ) {
 
     resource_deletion_queue.init( allocator, 16 );
     descriptor_set_updates.init( allocator, 16 );
+    bindless_texture_updates.init(allocator, 16);
 
     //
     // Init primitive resources
@@ -744,6 +824,7 @@ void GpuDevice::shutdown() {
 
     resource_deletion_queue.shutdown();
     descriptor_set_updates.shutdown();
+    bindless_texture_updates.shutdown();
 
     //command_buffers.shutdown();
     pipelines.shutdown();
@@ -1198,15 +1279,19 @@ PipelineHandle GpuDevice::create_pipeline( const PipelineCreation& creation ) {
         vk_layouts[ l ] = pipeline->descriptor_set_layout[ l ]->vk_descriptor_set_layout;
     }
 
+    if (bindless_supported) {
+        vk_layouts[creation.num_active_layouts] = vulkan_bindless_descriptor_set_layout;
+    }
+
     VkPipelineLayoutCreateInfo pipeline_layout_info = { VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO };
     pipeline_layout_info.pSetLayouts = vk_layouts;
-    pipeline_layout_info.setLayoutCount = creation.num_active_layouts;
+    pipeline_layout_info.setLayoutCount = creation.num_active_layouts + bindless_supported;
 
     VkPipelineLayout pipeline_layout;
     check( vkCreatePipelineLayout( vulkan_device, &pipeline_layout_info, vulkan_allocation_callbacks, &pipeline_layout ) );
     // Cache pipeline layout
     pipeline->vk_pipeline_layout = pipeline_layout;
-    pipeline->num_active_layouts = creation.num_active_layouts;
+    pipeline->num_active_layouts = creation.num_active_layouts + bindless_supported; // TODO: maybe I shouldn't do this
 
     // Create full pipeline
     if ( shader_state_data->graphics_pipeline ) {
@@ -2605,6 +2690,37 @@ void GpuDevice::new_frame() {
                 update.frame_issued = u32_max;
                 descriptor_set_updates.delete_swap( i );
             }
+        }
+    }
+
+    if (bindless_texture_updates.size) {
+        for (i32 i = bindless_texture_updates.size - 1; i >= 0; i--) {
+            ResourceUpdate& update = bindless_texture_updates[i];
+
+            Texture* texture = access_texture({ update.handle });
+
+            VkWriteDescriptorSet descriptor_write{ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET , nullptr};
+            VkDescriptorImageInfo image_info;
+
+            descriptor_write.descriptorCount = 1;
+            descriptor_write.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+            descriptor_write.dstArrayElement = update.handle;
+            descriptor_write.dstSet = vulkan_bindless_descriptor_set;
+            descriptor_write.dstBinding = k_bindless_texture_binding;
+            descriptor_write.pImageInfo = &image_info;
+
+            image_info.imageView = texture->vk_format == VK_FORMAT_UNDEFINED ? access_texture(dummy_texture)->vk_image_view : texture->vk_image_view;
+            image_info.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+            if (texture->sampler) {
+                image_info.sampler = texture->sampler->vk_sampler;
+            } else {
+                image_info.sampler = access_sampler({ default_sampler })->vk_sampler;
+            }
+
+            // TODO: instead of instant write I could cache it and write later
+            vkUpdateDescriptorSets(vulkan_device, 1, &descriptor_write, 0, nullptr);
+
+            bindless_texture_updates.delete_swap(i);
         }
     }
 }

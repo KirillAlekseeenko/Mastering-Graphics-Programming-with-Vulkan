@@ -71,6 +71,8 @@ static const u8                     k_max_vertex_attributes = 16;
 static const u32                    k_submit_header_sentinel = 0xfefeb7ba;
 static const u32                    k_max_resource_deletions = 64;
 
+static const u32                    k_bindless_texture_binding = 10;
+
 // Resource creation structs //////////////////////////////////////////////
 
 //
